@@ -3,7 +3,8 @@
 #![allow(missing_docs, clippy::missing_docs_in_private_items)]
 
 use crate::{
-    BootstrapBehavior, InertTorClient, Result, TorClient, TorClientConfig, err::ErrorDetail,
+    BootstrapBehavior, InertTorClient, Result, TorClient, TorClientConfig,
+    UnsupportedSoftwareAction, err::ErrorDetail,
 };
 use std::{result::Result as StdResult, sync::Arc};
 use tor_dirmgr::{DirMgrConfig, DirMgrStore};
@@ -59,6 +60,9 @@ pub struct TorClientBuilder<R: Runtime> {
     /// How the client should behave when it is asked to do something on the Tor
     /// network before `bootstrap()` is called.
     bootstrap_behavior: BootstrapBehavior,
+    /// What the client should do if the Tor network says that this software
+    /// is missing a required protocol.
+    unsupported_software_action: UnsupportedSoftwareAction,
     /// Optional object to construct a DirProvider.
     ///
     /// Wrapped in an Arc so that we don't need to force DirProviderBuilder to
@@ -92,6 +96,7 @@ impl<R: Runtime> TorClientBuilder<R> {
             runtime,
             config: TorClientConfig::default(),
             bootstrap_behavior: BootstrapBehavior::default(),
+            unsupported_software_action: UnsupportedSoftwareAction::default(),
             dirmgr_builder: Arc::new(DirMgrBuilder {}),
             local_resource_timeout: None,
             #[cfg(feature = "dirfilter")]
@@ -113,6 +118,18 @@ impl<R: Runtime> TorClientBuilder<R> {
     /// be used.
     pub fn bootstrap_behavior(mut self, bootstrap_behavior: BootstrapBehavior) -> Self {
         self.bootstrap_behavior = bootstrap_behavior;
+        self
+    }
+
+    /// Set what the `TorClient` under construction should do if the Tor network
+    /// says that this version of Arti is missing a protocol that it requires.
+    ///
+    /// If not called, then the default ([`UnsupportedSoftwareAction::ExitProcess`])
+    /// will be used, and the process will exit.
+    /// Applications that embed Arti will usually want
+    /// [`UnsupportedSoftwareAction::DisableClient`] instead.
+    pub fn on_unsupported_software(mut self, action: UnsupportedSoftwareAction) -> Self {
+        self.unsupported_software_action = action;
         self
     }
 
@@ -249,6 +266,7 @@ impl<R: Runtime> TorClientBuilder<R> {
             self.runtime.clone(),
             &self.config,
             self.bootstrap_behavior,
+            self.unsupported_software_action,
             Arc::clone(&self.dirmgr_builder),
             dirmgr_extensions,
         )

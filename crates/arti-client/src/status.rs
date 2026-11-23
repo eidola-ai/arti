@@ -62,6 +62,9 @@ impl BootstrapStatus {
     /// For the purposes of this function, the client is "ready for traffic" if,
     /// as far as we know, we can start acting on a new client request immediately.
     pub fn ready_for_traffic(&self) -> bool {
+        if self.bootstrap_setting.software_unsupported() {
+            return false;
+        }
         let now = SystemTime::get();
         self.conn_status.usable() && self.dir_status.usable_at(now)
     }
@@ -85,7 +88,14 @@ impl BootstrapStatus {
     /// can't make connections to the internet" rather than "You are
     /// not on the internet."
     pub fn blocked(&self) -> Option<Blockage> {
-        if self.bootstrap_setting.blocked() {
+        if self.bootstrap_setting.software_unsupported() {
+            Some(Blockage {
+                kind: BlockageKind::UnsupportedSoftware,
+                message: "This version of Arti lacks protocols that the Tor network requires; \
+                          upgrade Arti"
+                    .into(),
+            })
+        } else if self.bootstrap_setting.blocked() {
             Some(Blockage {
                 kind: BlockageKind::Disabled,
                 message: "Client is waiting to be told to bootstrap"
@@ -191,6 +201,13 @@ pub enum BlockageKind {
     /// connection problem.
     #[display("Can't bootstrap a Tor directory.")]
     CantBootstrap,
+    /// The Tor network requires a protocol that this version of Arti does not
+    /// support, so the client has stopped.
+    ///
+    /// The client will not recover: Arti must be upgraded.
+    /// See [`UnsupportedSoftwareAction`](crate::UnsupportedSoftwareAction).
+    #[display("This version of Arti is no longer supported by the Tor network")]
+    UnsupportedSoftware,
 }
 
 impl From<ConnBlockage> for BlockageKind {

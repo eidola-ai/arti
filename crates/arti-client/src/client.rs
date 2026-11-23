@@ -179,6 +179,10 @@ struct ClientShared<R: Runtime> {
     /// something that needs circuits and we have not been told to bootstrap.
     should_bootstrap: BootstrapBehavior,
 
+    /// What to do if the Tor network tells us that this software is missing
+    /// a required protocol.
+    unsupported_software_action: UnsupportedSoftwareAction,
+
     /// Shared boolean for whether we're currently in "dormant mode" or not.
     //
     // The sent value is `Option`, so that `None` is sent when the sender, here,
@@ -206,6 +210,17 @@ enum Inner<R: Runtime> {
 
     /// The client has failed in a non-recoverable way.
     Poisoned(Box<ErrorDetail>),
+}
+
+impl<R: Runtime> Inner<R> {
+    /// If this client has been disabled because it is missing a protocol
+    /// that the Tor network requires, return the error that disabled it.
+    fn unsupported_software_error(&self) -> Option<&ErrorDetail> {
+        match self {
+            Inner::Poisoned(e) if matches!(**e, ErrorDetail::MissingProtocol(_)) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 /// Information stored by a never-bootstrapped [`TorClient`],
@@ -597,6 +612,44 @@ pub enum BootstrapBehavior {
     Manual,
 }
 
+/// What a [`TorClient`] should do when the Tor network says that this version of Arti
+/// is missing a protocol that it requires.
+///
+/// The directory authorities publish lists of subprotocols that clients are
+/// required to support.  A client that lacks one of them may not work correctly
+/// on the network, and is likely to be insecure or to burden the network.
+///
+/// If the cached directory information already lists such a requirement when
+/// the client starts to bootstrap, bootstrapping fails with an error of kind
+/// [`ErrorKind::SoftwareDeprecated`](crate::ErrorKind::SoftwareDeprecated),
+/// whichever action is selected.  This setting controls what happens when such
+/// a requirement appears while the client is running.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsupportedSoftwareAction {
+    /// Log the problem, print it to stderr, and exit the process.
+    ///
+    /// This is the default, and is appropriate for a standalone Tor client.
+    #[default]
+    ExitProcess,
+    /// Permanently disable the [`TorClient`], but leave the process running.
+    ///
+    /// The client, and every handle cloned or isolated from it, refuses to do
+    /// anything further on the Tor network: operations such as
+    /// [`connect`](TorClient::connect) and [`resolve`](TorClient::resolve)
+    /// fail at once with an error of kind
+    /// [`ErrorKind::SoftwareDeprecated`](crate::ErrorKind::SoftwareDeprecated).
+    /// Its background tasks are put to sleep, and its
+    /// [bootstrap status](TorClient::bootstrap_status) reports a blockage of kind
+    /// [`BlockageKind::UnsupportedSoftware`](crate::status::BlockageKind::UnsupportedSoftware).
+    ///
+    /// The client stays in this state until it is dropped.
+    /// The only remedy is to upgrade Arti.
+    ///
+    /// This is appropriate when Arti is embedded in a larger application.
+    DisableClient,
+}
+
 /// A representation of whether a [`TorClient`] is allowed to bootstrap, and whether it
 /// has begun to do so.
 #[derive(Debug, Clone, Copy)]
@@ -607,6 +660,10 @@ pub(crate) struct BootstrapSetting {
     /// If true, we have a [`RunningInner`] in the `TorClient`,
     /// indicating that we are trying to bootstrap it.
     running_inner_is_present: bool,
+
+    /// If true, the `TorClient` has been disabled because this software is
+    /// missing a protocol that the Tor network requires.
+    software_unsupported: bool,
 }
 
 impl Default for BootstrapSetting {
@@ -614,6 +671,7 @@ impl Default for BootstrapSetting {
         Self {
             behavior: BootstrapBehavior::Manual,
             running_inner_is_present: false,
+            software_unsupported: false,
         }
     }
 }
@@ -629,6 +687,12 @@ impl BootstrapSetting {
             (Manual, true) => false,
             (Manual, false) => true,
         }
+    }
+
+    /// Return true if this [`BootstrapSetting`] indicates that the client has
+    /// been disabled because its software is unsupported.
+    pub(crate) fn software_unsupported(&self) -> bool {
+        self.software_unsupported
     }
 }
 
@@ -1013,6 +1077,7 @@ impl<R: Runtime> TorClient<R> {
         runtime: R,
         config: &TorClientConfig,
         autobootstrap: BootstrapBehavior,
+        unsupported_software_action: UnsupportedSoftwareAction,
         dirmgr_builder: Arc<dyn crate::builder::DirProviderBuilder<R>>,
         dirmgr_extensions: tor_dirmgr::config::DirMgrExtensions,
     ) -> StdResult<Arc<Self>, ErrorDetail> {
@@ -1046,6 +1111,7 @@ impl<R: Runtime> TorClient<R> {
         let bootstrap_setting = BootstrapSetting {
             behavior: autobootstrap,
             running_inner_is_present: false,
+            software_unsupported: false,
         };
         let (bootstrap_setting_sender, bootstrap_setting_receiver) =
             postage::watch::channel_with(bootstrap_setting);
@@ -1090,6 +1156,7 @@ impl<R: Runtime> TorClient<R> {
             bootstrap_in_progress: AsyncMutex::new(()),
             bootstrap_setting_sender,
             should_bootstrap: autobootstrap,
+            unsupported_software_action,
             dormant: Mutex::new(dormant_send),
             #[cfg(feature = "onion-service-service")]
             state_directory,
@@ -1173,7 +1240,7 @@ impl<R: Runtime> RunningInner<R> {
     /// Construct a new [`RunningInner`] and launch its associated tasks.
     fn new(
         pending: NotConstructedInner<R>,
-        client: &ClientShared<R>,
+        client: &Arc<ClientShared<R>>,
     ) -> StdResult<Arc<Self>, ErrorDetail> {
         let NotConstructedInner {
             config,
@@ -1292,35 +1359,56 @@ impl<R: Runtime> RunningInner<R> {
         let skew_status = circmgr.skew_events();
 
         let rtclone = runtime.clone();
+        let unsupported_software_action = client.unsupported_software_action;
+        let weak_client = Arc::downgrade(client);
 
         // TODO: It might be a good idea to check this earlier, in `create_impl`,
         // when we have only the DirMgrStore.
         // But if we do that we need to add a method to DirMgrStore
         // to look at the protocol recommentations.
         #[allow(clippy::print_stderr)]
-        crate::protostatus::enforce_protocol_recommendations(
+        let enforced = crate::protostatus::enforce_protocol_recommendations(
             &runtime,
             Arc::clone(&dirmgr),
             crate::software_release_date(),
             crate::supported_protocols(),
-            // TODO #1932: It would be nice to have a cleaner shutdown mechanism here,
-            // but that will take some work.
-            |fatal| async move {
-                use tor_error::ErrorReport as _;
-                // We already logged this error, but let's tell stderr too.
-                eprintln!(
-                    "Shutting down because of unsupported software version.\nError was:\n{}",
-                    fatal.report(),
-                );
-                if let Some(hint) = crate::err::Error::from(fatal).hint() {
-                    eprintln!("{}", hint);
+            move |fatal| async move {
+                match unsupported_software_action {
+                    UnsupportedSoftwareAction::DisableClient => {
+                        if let Some(client) = weak_client.upgrade() {
+                            client.disable_for_unsupported_software(fatal);
+                        }
+                    }
+                    // TODO #1932: It would be nice to have a cleaner shutdown mechanism here,
+                    // but that will take some work.
+                    UnsupportedSoftwareAction::ExitProcess => {
+                        use tor_error::ErrorReport as _;
+                        // We already logged this error, but let's tell stderr too.
+                        eprintln!(
+                            "Shutting down because of unsupported software version.\nError was:\n{}",
+                            fatal.report(),
+                        );
+                        if let Some(hint) = crate::err::Error::from(fatal).hint() {
+                            eprintln!("{}", hint);
+                        }
+                        // Give the tracing module a while to flush everything, since it has no built-in
+                        // flush function.
+                        rtclone.sleep(std::time::Duration::new(5, 0)).await;
+                        std::process::exit(1);
+                    }
                 }
-                // Give the tracing module a while to flush everything, since it has no built-in
-                // flush function.
-                rtclone.sleep(std::time::Duration::new(5, 0)).await;
-                std::process::exit(1);
             },
-        )?;
+        );
+        if let Err(e) = enforced {
+            if matches!(e, ErrorDetail::MissingProtocol(_)) {
+                // Our cached protocol recommendations say that we can't run.
+                // The status reporter isn't running yet, so report this directly.
+                let setting = client.note_software_unsupported();
+                let mut status_sender = status_sender;
+                status_sender.borrow_mut().apply_bootstrap_setting(setting);
+            }
+            return Err(e);
+        }
 
         runtime
             .spawn(status::report_status(
@@ -1587,6 +1675,7 @@ impl<R: Runtime> TorClient<R> {
         target: A,
         prefs: &StreamPrefs,
     ) -> crate::Result<DataStream> {
+        self.client.check_software_supported()?;
         let addr = target.into_tor_addr().map_err(wrap_err)?;
         let mut stream_parameters = prefs.stream_parameters();
         // This macro helps prevent code duplication in the match below.
@@ -1726,6 +1815,7 @@ impl<R: Runtime> TorClient<R> {
         hostname: &str,
         prefs: &StreamPrefs,
     ) -> crate::Result<Vec<IpAddr>> {
+        self.client.check_software_supported()?;
         // TODO This dummy port is only because `address::Host` is not pub(crate),
         // but I see no reason why it shouldn't be?  Then `into_resolve_instructions`
         // should be a method on `Host`, not `TorAddr`.  -Diziet.
@@ -1792,6 +1882,7 @@ impl<R: Runtime> TorClient<R> {
         addr: IpAddr,
         prefs: &StreamPrefs,
     ) -> crate::Result<Vec<String>> {
+        self.client.check_software_supported()?;
         let addrcfg = self.client.addrcfg.get();
         let allow_resolving_local_addrs = prefs
             .resolve_local_addrs
@@ -2322,7 +2413,17 @@ impl<R: Runtime> TorClient<R> {
     /// client for a while, especially on mobile platforms.
     ///
     /// See the [`DormantMode`] documentation for more details.
+    ///
+    /// If the client has been disabled because its software is unsupported
+    /// (see [`UnsupportedSoftwareAction::DisableClient`]),
+    /// its background tasks stay asleep, and this method has no effect.
     pub fn set_dormant(&self, mode: DormantMode) {
+        // Lock order: `inner` before `dormant`.
+        let inner = self.client.inner.lock().expect("lock poisoned");
+        if inner.unsupported_software_error().is_some() {
+            debug!("Ignoring change to dormant mode: client disabled for unsupported software.");
+            return;
+        }
         *self
             .client
             .dormant
@@ -2356,7 +2457,7 @@ impl<R: Runtime> TorClient<R> {
 impl<R: Runtime> ClientShared<R> {
     /// Used by `bootstrap_inner`: Return a `RunningInner`, constructing it if necessary.
     fn instantiate_running_inner(
-        &self,
+        self: &Arc<Self>,
         mut inner_guard: std::sync::MutexGuard<'_, Inner<R>>,
     ) -> Result<Arc<RunningInner<R>>, ErrorDetail> {
         match &*inner_guard {
@@ -2390,7 +2491,7 @@ impl<R: Runtime> ClientShared<R> {
 
     /// Implementation of `bootstrap`, split out in order to avoid manually specifying
     /// double error conversions.
-    async fn bootstrap_inner(&self) -> StdResult<(), ErrorDetail> {
+    async fn bootstrap_inner(self: &Arc<Self>) -> StdResult<(), ErrorDetail> {
         // Wait for an existing bootstrap attempt to finish first.
         //
         // This is a futures::lock::Mutex, so it's okay to await while we hold it.
@@ -2470,7 +2571,7 @@ impl<R: Runtime> ClientShared<R> {
     /// Then see whether we're bootstrapped, and return either a success or a failure.
     #[instrument(skip_all, level = "trace")]
     async fn wait_for_bootstrap_running(
-        &self,
+        self: &Arc<Self>,
         action: &'static str,
     ) -> StdResult<Arc<RunningInner<R>>, ErrorDetail> {
         match self.should_bootstrap {
@@ -2482,6 +2583,9 @@ impl<R: Runtime> ClientShared<R> {
                 self.bootstrap_in_progress.lock().await;
             }
         }
+        // Find out whether we're running before we wake anything up:
+        // a client that can't be used should stay asleep.
+        let running = self.running_inner(action)?;
         self.dormant
             .lock()
             .map_err(|_| internal!("dormant poisoned"))?
@@ -2493,7 +2597,7 @@ impl<R: Runtime> ClientShared<R> {
                     }
                 }))
             })?;
-        self.running_inner(action)
+        Ok(running)
     }
 
     /// If we are currently bootstrapping or running, return a [`RunningInner`].
@@ -2511,7 +2615,7 @@ impl<R: Runtime> ClientShared<R> {
     /// Return an error if our [`BootstrapBehavior`] is `Manual` and have not created a
     /// [`RunningInner`].
     fn initiate_bootstrap_if_needed(
-        &self,
+        self: &Arc<Self>,
         action: &'static str,
     ) -> StdResult<Arc<RunningInner<R>>, ErrorDetail> {
         let guard = self.inner.lock().expect("Lock poisoned");
@@ -2523,6 +2627,52 @@ impl<R: Runtime> ClientShared<R> {
                 BootstrapBehavior::OnDemand => self.instantiate_running_inner(guard),
             },
         }
+    }
+
+    /// Return an error if this client has been disabled because its software
+    /// is missing a protocol that the Tor network requires.
+    fn check_software_supported(&self) -> StdResult<(), ErrorDetail> {
+        let inner = self.inner.lock().expect("lock poisoned");
+        match inner.unsupported_software_error() {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Record that this client has been disabled because its software is
+    /// unsupported, and return the resulting [`BootstrapSetting`].
+    fn note_software_unsupported(&self) -> BootstrapSetting {
+        let mut sender = self.bootstrap_setting_sender.lock().expect("lock poisoned");
+        let mut setting = sender.borrow_mut();
+        setting.software_unsupported = true;
+        *setting
+    }
+
+    /// Permanently disable this client, because the Tor network requires a
+    /// protocol that this software does not support.
+    ///
+    /// Called from the protocol-recommendation monitor when the action is
+    /// [`UnsupportedSoftwareAction::DisableClient`].
+    fn disable_for_unsupported_software(&self, error: ErrorDetail) {
+        tracing::error!(
+            "Disabling this Tor client: this version of Arti lacks protocols that the Tor network requires. Upgrade Arti to use Tor again."
+        );
+        let old_inner = {
+            // Lock order: `inner` before `dormant`.
+            let mut inner = self.inner.lock().expect("lock poisoned");
+            let old_inner = std::mem::replace(&mut *inner, Inner::Poisoned(Box::new(error)));
+            // Put the background tasks to sleep.  Since the client is now disabled,
+            // nothing will wake them up again.
+            match self.dormant.lock() {
+                Ok(mut dormant) => *dormant.borrow_mut() = Some(DormantMode::Soft),
+                Err(_) => warn!("dormant lock poisoned; cannot suspend background tasks"),
+            }
+            old_inner
+        };
+        // Drop our reference to the running state outside the lock.
+        drop(old_inner);
+
+        let _: BootstrapSetting = self.note_software_unsupported();
     }
 
     /// This is split out from `reconfigure` so we can do the all-or-nothing
@@ -2828,5 +2978,244 @@ mod test {
                 .reconfigure(&cfg, Reconfigure::AllOrNothing)
                 .unwrap();
         });
+    }
+
+    /// Tests for the behavior of a client when the Tor network requires a protocol that it lacks.
+    mod unsupported_software {
+        use super::*;
+        use crate::builder::DirProviderBuilder;
+        use futures::stream::BoxStream;
+        use postage::sink::Sink as _;
+        use std::time::{Duration, SystemTime};
+        use tor_dirmgr::{DirBootstrapStatus, DirMgrConfig, DirProvider};
+        use tor_netdir::{DirEvent, NetDir};
+        use tor_netdoc::doc::netstatus::ProtoStatuses;
+        use tor_rtmock::MockRuntime;
+
+        use crate::status::BlockageKind;
+
+        /// A `DirProvider` with no directory, whose protocol recommendations we control.
+        struct FakeDirProvider {
+            /// Sender for the events that we announce.
+            events: Mutex<postage::broadcast::Sender<DirEvent>>,
+            /// Kept so that the event channel stays open.
+            _events_rx: postage::broadcast::Receiver<DirEvent>,
+            /// The protocol recommendations that we report.
+            statuses: Mutex<Option<(SystemTime, Arc<ProtoStatuses>)>>,
+        }
+
+        impl FakeDirProvider {
+            /// Make a new `FakeDirProvider` that reports `statuses`.
+            fn new(statuses: Option<ProtoStatuses>) -> Arc<Self> {
+                let (tx, rx) = postage::broadcast::channel(16);
+                Arc::new(FakeDirProvider {
+                    events: Mutex::new(tx),
+                    _events_rx: rx,
+                    statuses: Mutex::new(statuses.map(|s| (recommendation_time(), Arc::new(s)))),
+                })
+            }
+
+            /// Report `statuses` as the latest recommendations, and announce them.
+            async fn announce(&self, statuses: ProtoStatuses) {
+                *self.statuses.lock().unwrap() = Some((recommendation_time(), Arc::new(statuses)));
+                let mut tx = self.events.lock().unwrap().clone();
+                tx.send(DirEvent::NewProtocolRecommendation).await.unwrap();
+            }
+        }
+
+        impl tor_netdir::NetDirProvider for FakeDirProvider {
+            fn netdir(&self, _: Timeliness) -> tor_netdir::Result<Arc<NetDir>> {
+                Err(tor_netdir::Error::NoInfo)
+            }
+            fn events(&self) -> BoxStream<'static, DirEvent> {
+                Box::pin(self.events.lock().unwrap().subscribe())
+            }
+            fn params(&self) -> Arc<dyn AsRef<NetParameters>> {
+                Arc::new(NetParameters::default())
+            }
+            fn protocol_statuses(&self) -> Option<(SystemTime, Arc<ProtoStatuses>)> {
+                self.statuses.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl DirProvider for FakeDirProvider {
+            fn reconfigure(
+                &self,
+                _: &DirMgrConfig,
+                _: tor_config::Reconfigure,
+            ) -> StdResult<(), tor_config::ReconfigureError> {
+                Ok(())
+            }
+            async fn bootstrap(&self) -> tor_dirmgr::Result<()> {
+                Ok(())
+            }
+            fn bootstrap_events(&self) -> BoxStream<'static, DirBootstrapStatus> {
+                Box::pin(futures::stream::pending())
+            }
+        }
+
+        /// A `DirProviderBuilder` that hands out a `FakeDirProvider`.
+        struct FakeDirProviderBuilder(Arc<FakeDirProvider>);
+
+        impl<R: Runtime> DirProviderBuilder<R> for FakeDirProviderBuilder {
+            fn build(
+                &self,
+                _: R,
+                _: DirMgrStore<R>,
+                _: Arc<tor_circmgr::CircMgr<R>>,
+                _: DirMgrConfig,
+            ) -> crate::Result<Arc<dyn DirProvider + 'static>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        /// A time after this software's release, so that recommendations from it are enforced.
+        fn recommendation_time() -> SystemTime {
+            crate::software_release_date() + Duration::from_secs(86400)
+        }
+
+        /// Protocol recommendations that this software satisfies.
+        fn satisfiable() -> ProtoStatuses {
+            serde_json::from_str(
+                r#"{
+                    "client": { "recommended": "Relay=2", "required": "Relay=2" },
+                    "relay": { "recommended": "", "required": "" }
+                }"#,
+            )
+            .unwrap()
+        }
+
+        /// Protocol recommendations that require a protocol this software lacks.
+        fn unsatisfiable() -> ProtoStatuses {
+            serde_json::from_str(
+                r#"{
+                    "client": { "recommended": "Relay=2,63", "required": "Relay=63" },
+                    "relay": { "recommended": "", "required": "" }
+                }"#,
+            )
+            .unwrap()
+        }
+
+        /// Make a client that uses `provider` for its directory.
+        fn make_client(
+            rt: &MockRuntime,
+            provider: &Arc<FakeDirProvider>,
+            action: UnsupportedSoftwareAction,
+        ) -> (tempfile::TempDir, Arc<TorClient<MockRuntime>>) {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(
+                dir.path().join("state"),
+                dir.path().join("cache"),
+            )
+            .build()
+            .unwrap();
+            let client = TorClient::create_impl(
+                rt.clone(),
+                &cfg,
+                BootstrapBehavior::OnDemand,
+                action,
+                Arc::new(FakeDirProviderBuilder(provider.clone())),
+                Default::default(),
+            )
+            .unwrap();
+            (dir, client)
+        }
+
+        /// Assert that `client` reports that it has been disabled.
+        fn assert_disabled(client: &TorClient<MockRuntime>) {
+            let status = client.bootstrap_status();
+            assert!(!status.ready_for_traffic());
+            let blockage = status.blocked().expect("not blocked");
+            assert!(
+                matches!(blockage.kind(), BlockageKind::UnsupportedSoftware),
+                "{blockage}"
+            );
+        }
+
+        /// Assert that `r` failed because the software is unsupported.
+        fn assert_unsupported<T: std::fmt::Debug>(r: crate::Result<T>) {
+            let e = r.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::SoftwareDeprecated, "{e}");
+        }
+
+        /// Return the dormant mode that `client` has last requested for its background tasks.
+        fn dormant_mode(client: &TorClient<MockRuntime>) -> Option<DormantMode> {
+            *client.client.dormant.lock().unwrap().borrow()
+        }
+
+        #[test]
+        fn disabled_at_runtime() {
+            MockRuntime::test_with_various(|rt| async move {
+                let provider = FakeDirProvider::new(None);
+                let (_dir, client) =
+                    make_client(&rt, &provider, UnsupportedSoftwareAction::DisableClient);
+                let isolated = client.isolated_client();
+
+                client.bootstrap().await.unwrap();
+                rt.progress_until_stalled().await;
+                assert!(client.bootstrap_status().blocked().is_none());
+
+                // Recommendations that we can satisfy change nothing.
+                provider.announce(satisfiable()).await;
+                rt.progress_until_stalled().await;
+                assert!(client.client.check_software_supported().is_ok());
+                assert!(client.bootstrap_status().blocked().is_none());
+
+                // Recommendations that we can't satisfy disable the client.
+                provider.announce(unsatisfiable()).await;
+                rt.progress_until_stalled().await;
+
+                assert_unsupported(client.connect(("example.com", 80)).await);
+                assert_unsupported(
+                    client
+                        .connect_with_prefs(("example.com", 80), &StreamPrefs::new())
+                        .await,
+                );
+                assert_unsupported(client.resolve("example.com").await);
+                assert_unsupported(client.resolve("127.0.0.1").await);
+                assert_unsupported(client.resolve_ptr("192.0.2.1".parse().unwrap()).await);
+                assert_unsupported(client.bootstrap().await);
+                assert_disabled(&client);
+
+                // Handles made from the client before and after are disabled too.
+                assert_unsupported(isolated.connect(("example.com", 80)).await);
+                assert_unsupported(client.isolated_client().connect(("example.com", 80)).await);
+                let mut prefs = StreamPrefs::new();
+                prefs.ipv4_only();
+                assert_unsupported(client.with_prefs(prefs).resolve("example.com").await);
+                assert_disabled(&isolated);
+
+                // Background tasks are put to sleep, and nothing wakes them.
+                assert_eq!(dormant_mode(&client), Some(DormantMode::Soft));
+                client.set_dormant(DormantMode::Normal);
+                assert_eq!(dormant_mode(&client), Some(DormantMode::Soft));
+
+                // The process is still here, well after the exit path would have ended it.
+                rt.advance_by(Duration::from_secs(60)).await;
+                assert_unsupported(client.connect(("example.com", 80)).await);
+                assert_disabled(&client);
+            });
+        }
+
+        #[test]
+        fn rejected_at_startup() {
+            for action in [
+                UnsupportedSoftwareAction::ExitProcess,
+                UnsupportedSoftwareAction::DisableClient,
+            ] {
+                MockRuntime::test_with_various(|rt| async move {
+                    // Our cached recommendations already say that we can't run.
+                    let provider = FakeDirProvider::new(Some(unsatisfiable()));
+                    let (_dir, client) = make_client(&rt, &provider, action);
+
+                    assert_unsupported(client.bootstrap().await);
+                    assert_unsupported(client.connect(("example.com", 80)).await);
+                    assert_unsupported(client.resolve("example.com").await);
+                    rt.progress_until_stalled().await;
+                    assert_disabled(&client);
+                });
+            }
+        }
     }
 }

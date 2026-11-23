@@ -66,7 +66,10 @@ pub mod status;
 
 pub use address::{DangerouslyIntoTorAddr, IntoTorAddr, TorAddr, TorAddrError};
 pub use builder::{MAX_LOCAL_RESOURCE_TIMEOUT, TorClientBuilder};
-pub use client::{BootstrapBehavior, DormantMode, InertTorClient, StreamPrefs, TorClient};
+pub use client::{
+    BootstrapBehavior, DormantMode, InertTorClient, StreamPrefs, TorClient,
+    UnsupportedSoftwareAction,
+};
 pub use config::TorClientConfig;
 
 pub use tor_circmgr::IsolationToken;

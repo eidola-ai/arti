@@ -350,6 +350,7 @@ dependencies = [
  "tor-relay-selection",
  "tor-rpcbase",
  "tor-rtcompat",
+ "tor-rtmock",
  "tracing",
  "tracing-subscriber",
  "tracing-test",
