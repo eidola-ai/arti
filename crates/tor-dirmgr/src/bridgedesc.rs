@@ -34,7 +34,8 @@ use crate::event::FlagPublisher;
 use crate::storage::CachedBridgeDescriptor;
 use crate::{DirMgrStore, DynStore};
 
-#[cfg(test)]
+// These tests inspect the SQLite database directly.
+#[cfg(all(test, feature = "sqlite"))]
 mod bdtest;
 
 /// The key we use in all our data structures
@@ -579,7 +580,7 @@ impl<R: Runtime, M: Mockable<R>> BridgeDescMgr<R, M> {
     }
 
     /// Consistency check convenience wrapper
-    #[cfg(test)]
+    #[cfg(all(test, feature = "sqlite"))]
     fn check_consistency<'i, I>(&self, input_bridges: Option<I>)
     where
         I: IntoIterator<Item = &'i BridgeKey>,
@@ -1416,7 +1417,7 @@ impl State {
     ///
     /// Does not make any changes.
     /// Only takes `&mut` because postage::watch::Sender::borrow` wants it.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "sqlite"))]
     fn check_consistency<'i, R, I>(&mut self, runtime: &R, input: Option<I>)
     where
         R: Runtime,

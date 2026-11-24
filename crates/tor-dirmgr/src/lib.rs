@@ -57,11 +57,26 @@
 mod bootstrap;
 pub mod config;
 mod docid;
+// These items are public via `storage` with `custom-store`;
+// without any store implementation, some of them are unused.
+#[cfg_attr(not(feature = "custom-store"), allow(unreachable_pub))]
+#[cfg_attr(
+    not(any(feature = "sqlite", feature = "custom-store")),
+    allow(dead_code)
+)]
 mod docmeta;
 mod err;
 mod event;
 mod shared_ref;
 mod state;
+#[cfg(feature = "custom-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "custom-store")))]
+pub mod storage;
+// These items are public with `custom-store`;
+// without any store implementation, some of them are unused.
+#[cfg(not(feature = "custom-store"))]
+#[allow(unreachable_pub)]
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 mod storage;
 
 #[cfg(feature = "dir-plugin")]
@@ -126,7 +141,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Storage manager used by [`DirMgr`] and
 /// [`BridgeDescMgr`](bridgedesc::BridgeDescMgr)
 ///
-/// Internally, this wraps up a sqlite database.
+/// Internally, this wraps up a directory store:
+/// by default, a sqlite database.
 ///
 /// This is a handle, which is cheap to clone; clones share state.
 #[derive(Clone)]
@@ -1239,10 +1255,96 @@ mod test {
             cache_dir: dir.path().into(),
             ..Default::default()
         };
-        let store = DirMgrStore::new(&config, runtime.clone(), false).unwrap();
+        let store = new_test_store(&config, runtime.clone());
         let dirmgr = DirMgr::from_config(config, runtime, store, None, false).unwrap();
 
         (dir, dirmgr)
+    }
+
+    /// Open a store for testing: the default store if we have one, or else a `MemoryStore`.
+    fn new_test_store<R: Runtime>(config: &DirMgrConfig, runtime: R) -> DirMgrStore<R> {
+        #[cfg(feature = "sqlite")]
+        {
+            DirMgrStore::new(config, runtime, false).unwrap()
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (config, runtime);
+            DirMgrStore {
+                store: Arc::new(Mutex::new(Box::new(storage::memory::MemoryStore::new()))),
+                runtime: PhantomData,
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "custom-store")]
+    fn injected_store() {
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let now = rt.wallclock();
+            let dir = TempDir::new().unwrap();
+            let opened = Arc::new(Mutex::new(Vec::new()));
+            let mut config = DirMgrConfig {
+                cache_dir: dir.path().into(),
+                ..Default::default()
+            };
+            let opened_ = Arc::clone(&opened);
+            config.extensions.store_opener = Some(Arc::new(
+                move |cfg: &DirMgrConfig, readonly: bool| -> Result<Box<dyn storage::Store>> {
+                    opened_
+                        .lock()
+                        .unwrap()
+                        .push((cfg.cache_dir.clone(), readonly));
+                    // Give each store something that only it could know.
+                    let mut store = storage::MemoryStore::new();
+                    store.store_microdescs(&[("Injected micro", &[5; 32])], now)?;
+                    Ok(Box::new(store))
+                },
+            ));
+
+            let store = DirMgrStore::new(&config, rt.clone(), false).unwrap();
+            assert_eq!(*opened.lock().unwrap(), [(dir.path().to_owned(), false)]);
+            let mgr = DirMgr::from_config(config.clone(), rt.clone(), store, None, false).unwrap();
+
+            // Documents come from the injected store.
+            let text = mgr.text(&DocId::Microdesc([5; 32])).unwrap().unwrap();
+            assert_eq!(text.as_str(), Ok("Injected micro"));
+            // ... and go to it.
+            mgr.store
+                .lock()
+                .unwrap()
+                .store_microdescs(&[("Another micro", &[7; 32])], now)
+                .unwrap();
+            let text = mgr.text(&DocId::Microdesc([7; 32])).unwrap().unwrap();
+            assert_eq!(text.as_str(), Ok("Another micro"));
+
+            // Offline loads open the store read-only.
+            assert!(DirMgr::load_once(rt, config).is_err());
+            assert_eq!(opened.lock().unwrap().last().unwrap().1, true);
+
+            // Nothing went into the default store.
+            assert!(!dir.path().join("dir.sqlite3").try_exists().unwrap());
+            assert!(!dir.path().join("dir_blobs").try_exists().unwrap());
+        });
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite"))]
+    fn no_store() {
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let dir = TempDir::new().unwrap();
+            let config = DirMgrConfig {
+                cache_dir: dir.path().into(),
+                ..Default::default()
+            };
+            let err = DirMgrStore::new(&config, rt, false).err().unwrap();
+            assert_eq!(
+                tor_error::HasKind::kind(&err),
+                tor_error::ErrorKind::BadApiUsage
+            );
+            let report = tor_error::ErrorReport::report(&err).to_string();
+            assert!(report.contains("No directory store configured"), "{report}");
+        });
     }
 
     #[test]

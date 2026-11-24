@@ -28,8 +28,19 @@ pub enum Error {
     #[error("Corrupt cache: {0}")]
     CacheCorruption(&'static str),
     /// rusqlite gave us an error.
+    #[cfg(feature = "sqlite")]
     #[error("Error from sqlite database")]
     SqliteError(#[source] Arc<rusqlite::Error>),
+    /// A directory store supplied by the application gave us an error.
+    #[error("Error from directory store")]
+    ExternalStore {
+        /// What happened
+        #[source]
+        cause: Arc<dyn std::error::Error + Send + Sync + 'static>,
+
+        /// The kind
+        kind: ErrorKind,
+    },
     /// Error while creating a read-only store.
     #[error("Failed to create read-only store")]
     ReadOnlyStorage(#[from] ReadOnlyStorageError),
@@ -214,6 +225,7 @@ impl Error {
 
     /// Construct a new `Error` from `std::io::Error` for an error that occurred
     /// while locking a file.
+    #[cfg(feature = "sqlite")]
     pub(crate) fn from_lockfile(err: std::io::Error) -> Error {
         Error::LockFile(Arc::new(err))
     }
@@ -237,7 +249,7 @@ impl Error {
             | Error::CacheCorruption(_)
             | Error::CachePermissions(_)
             | Error::CacheAccess(_)
-            | Error::SqliteError(_)
+            | Error::ExternalStore { .. }
             | Error::ReadOnlyStorage(_)
             | Error::UnrecognizedSchema { .. }
             | Error::DirectoryNotPresent
@@ -252,6 +264,9 @@ impl Error {
             | Error::NetDirOlder
             | Error::BadJsonInCache(_)
             | Error::Bug(_) => false,
+
+            #[cfg(feature = "sqlite")]
+            Error::SqliteError(_) => false,
 
             // For this one, we delegate.
             Error::DirClientError(e) => e.should_retire_circ(),
@@ -309,7 +324,7 @@ impl Error {
             Error::NoDownloadSupport
             | Error::OfflineMode
             | Error::CacheCorruption(_)
-            | Error::SqliteError(_)
+            | Error::ExternalStore { .. }
             | Error::ReadOnlyStorage(_)
             | Error::UnrecognizedSchema { .. }
             | Error::ManagerDropped
@@ -323,12 +338,16 @@ impl Error {
             | Error::BadJsonInCache(_)
             | Error::ExternalDirProvider { .. } => BootstrapAction::Fatal,
 
+            #[cfg(feature = "sqlite")]
+            Error::SqliteError(_) => BootstrapAction::Fatal,
+
             // These should actually be impossible during the bootstrap process.
             Error::DirectoryNotPresent | Error::Bug(_) => BootstrapAction::Fatal,
         }
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for Error {
     fn from(err: rusqlite::Error) -> Self {
         use ErrorKind as EK;
@@ -354,7 +373,9 @@ impl HasKind for Error {
             E::CacheCorruption(_) => EK::CacheCorrupted,
             E::CachePermissions(e) => e.cache_error_kind(),
             E::CacheAccess(e) => e.cache_error_kind(),
+            #[cfg(feature = "sqlite")]
             E::SqliteError(e) => sqlite_error_kind(e),
+            E::ExternalStore { kind, .. } => *kind,
             E::ReadOnlyStorage(_) => EK::LocalResourceAlreadyInUse,
             E::UnrecognizedSchema { .. } => EK::CacheCorrupted,
             E::BadJsonInCache(_) => EK::CacheCorrupted,
@@ -389,6 +410,7 @@ impl HasKind for Error {
 }
 
 /// Convert a sqlite error code into a real ErrorKind.
+#[cfg(feature = "sqlite")]
 fn sqlite_error_kind(e: &rusqlite::Error) -> ErrorKind {
     use ErrorKind as EK;
     use rusqlite::ErrorCode as RE;

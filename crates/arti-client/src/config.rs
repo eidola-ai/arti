@@ -50,6 +50,13 @@ pub mod dir {
     };
     pub use tor_dircommon::retry::{DownloadSchedule, DownloadScheduleBuilder};
     pub use tor_dirmgr::{DirMgrConfig, FallbackDir, FallbackDirBuilder};
+
+    /// Types for supplying a directory store of your own.
+    ///
+    /// See [`TorClientBuilder::dirmgr_store_opener`](crate::TorClientBuilder::dirmgr_store_opener).
+    #[cfg(feature = "custom-dir-store")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "custom-dir-store")))]
+    pub use tor_dirmgr::storage;
 }
 
 /// Types for configuring pluggable transports.

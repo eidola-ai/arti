@@ -249,6 +249,10 @@ match tor_client.connect(("example.com", 80)).await {
 * `async-std` -- build with [async-std](https://async.rs/) support.
 * `compression` (default) -- Build support for downloading compressed
   documents. Requires a C compiler.
+* `sqlite` (default) -- Store directory information in an SQLite database.
+  Without this feature, a store must be supplied with
+  `TorClientBuilder::dirmgr_store_opener`, from the experimental
+  `custom-dir-store` feature.
 * `bridge-client` -- Build with support for bridges.
 * `onion-service-client` -- Build with support for connecting to onion
   services.
@@ -302,6 +306,8 @@ implementation with another.
 * `error_detail` -- expose the `arti_client::Error` inner error type.
 * `dirfilter` -- expose the `DirFilter` API, which lets you modify a network
   directory before it is used.
+* `custom-dir-store` -- let an application supply its own directory store,
+  in place of the SQLite one, with `TorClientBuilder::dirmgr_store_opener`.
 * `onion-service-cli-extra` -- build with additional key and state management
   command line functionalities.
 * `smol` -- build with [smol](https://github.com/smol-rs/smol) support.

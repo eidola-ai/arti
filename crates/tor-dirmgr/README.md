@@ -30,6 +30,10 @@ keeping a cache of it on disk.
 * `bridge-client`: Provide APIs used to fetch
   and use bridge information.
 
+* `sqlite` (default) -- Store directory information in an SQLite
+  database.  Without this feature, a store must be supplied through
+  the experimental `custom-store` API.
+
 * `full` -- Enable all features above.
 
 ### Non-additive features
@@ -47,6 +51,10 @@ them between patch versions.
 
 * `dirfilter`: enable an experimental mechanism to modify incoming
   directory information before it is used.
+
+* `custom-store`: expose the `storage::Store` trait, and let an
+  application supply its own directory store through
+  `DirMgrExtensions::store_opener`.
 
 * `experimental`: Enable all the above experimental features.
 

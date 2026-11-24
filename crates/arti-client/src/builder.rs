@@ -71,6 +71,9 @@ pub struct TorClientBuilder<R: Runtime> {
     /// If present, an amount of time to wait when trying to acquire the filesystem locks for our
     /// storage.
     local_resource_timeout: Option<Duration>,
+    /// Optional object to open the directory store, in place of the default one.
+    #[cfg(feature = "custom-dir-store")]
+    dirmgr_store_opener: Option<Arc<dyn tor_dirmgr::storage::StoreOpener>>,
     /// Optional directory filter to install for testing purposes.
     ///
     /// Only available when `arti-client` is built with the `dirfilter` and `experimental-api` features.
@@ -99,6 +102,8 @@ impl<R: Runtime> TorClientBuilder<R> {
             unsupported_software_action: UnsupportedSoftwareAction::default(),
             dirmgr_builder: Arc::new(DirMgrBuilder {}),
             local_resource_timeout: None,
+            #[cfg(feature = "custom-dir-store")]
+            dirmgr_store_opener: None,
             #[cfg(feature = "dirfilter")]
             dirfilter: None,
         }
@@ -162,6 +167,27 @@ impl<R: Runtime> TorClientBuilder<R> {
         B: DirProviderBuilder<R> + 'static,
     {
         self.dirmgr_builder = builder;
+        self
+    }
+
+    /// Use `opener` to open the directory manager's store, in place of the
+    /// default SQLite store.
+    ///
+    /// The opener is called once, when the `TorClient` is created, with the
+    /// directory configuration and a read-only flag;
+    /// see [`StoreOpener`](tor_dirmgr::storage::StoreOpener).
+    ///
+    /// If `arti-client` is built without the `sqlite` feature,
+    /// this must be called: otherwise, creating the `TorClient` fails.
+    ///
+    /// Only available when compiled with the `custom-dir-store` feature:
+    /// this code is unstable.
+    #[cfg(feature = "custom-dir-store")]
+    pub fn dirmgr_store_opener(
+        mut self,
+        opener: Arc<dyn tor_dirmgr::storage::StoreOpener>,
+    ) -> Self {
+        self.dirmgr_store_opener = Some(opener);
         self
     }
 
@@ -260,6 +286,12 @@ impl<R: Runtime> TorClientBuilder<R> {
         #[cfg(feature = "dirfilter")]
         {
             dirmgr_extensions.filter.clone_from(&self.dirfilter);
+        }
+        #[cfg(feature = "custom-dir-store")]
+        {
+            dirmgr_extensions
+                .store_opener
+                .clone_from(&self.dirmgr_store_opener);
         }
 
         let result: Result<Arc<TorClient<R>>> = TorClient::create_impl(

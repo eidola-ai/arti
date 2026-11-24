@@ -1,9 +1,11 @@
 //! Types to describe information about other downloaded directory
 //! documents, without necessarily having the full document.
 //!
-//! These types are all local within tor-dirmgr.  They're used so that
-//! the storage code doesn't need to know about all of the parsed
-//! types from tor-netdoc.
+//! These types are used so that the storage code doesn't need to know
+//! about all of the parsed types from tor-netdoc.
+//!
+//! They are exposed through [`storage`](crate::storage) when the
+//! `custom-store` feature is enabled.
 
 use digest::Digest;
 use tor_llcrypto as ll;
@@ -19,7 +21,7 @@ use std::time::SystemTime;
 /// This information is ordinarily derived from the consensus, but doesn't
 /// have to be.
 #[derive(Debug, Clone)]
-pub(crate) struct ConsensusMeta {
+pub struct ConsensusMeta {
     /// The time over which the consensus is valid.
     lifetime: Lifetime,
     /// A sha3-256 digest of the signed portion of the consensus: used for
@@ -32,7 +34,7 @@ pub(crate) struct ConsensusMeta {
 
 impl ConsensusMeta {
     /// Create a new ConsensusMeta
-    pub(crate) fn new(
+    pub fn new(
         lifetime: Lifetime,
         sha3_256_of_signed: [u8; 32],
         sha3_256_of_whole: [u8; 32],
@@ -63,15 +65,15 @@ impl ConsensusMeta {
         ConsensusMeta::new(lifetime, sd, wd)
     }
     /// Return the lifetime of this ConsensusMeta
-    pub(crate) fn lifetime(&self) -> &Lifetime {
+    pub fn lifetime(&self) -> &Lifetime {
         &self.lifetime
     }
     /// Return the sha3-256 of the signed portion of this consensus.
-    pub(crate) fn sha3_256_of_signed(&self) -> &[u8; 32] {
+    pub fn sha3_256_of_signed(&self) -> &[u8; 32] {
         &self.sha3_256_of_signed
     }
     /// Return the sha3-256 of the entirety of this consensus.
-    pub(crate) fn sha3_256_of_whole(&self) -> &[u8; 32] {
+    pub fn sha3_256_of_whole(&self) -> &[u8; 32] {
         &self.sha3_256_of_whole
     }
 }
@@ -92,7 +94,7 @@ fn sha3_dual(signed_part: impl AsRef<[u8]>, remainder: impl AsRef<[u8]>) -> ([u8
 /// This information is ordinarily derived from the authority cert, but it
 /// doesn't have to be.
 #[derive(Clone, Debug)]
-pub(crate) struct AuthCertMeta {
+pub struct AuthCertMeta {
     /// Key IDs (identity and signing) for the certificate.
     ids: AuthCertKeyIds,
     /// Time of publication.
@@ -103,7 +105,7 @@ pub(crate) struct AuthCertMeta {
 
 impl AuthCertMeta {
     /// Construct a new AuthCertMeta from its components
-    pub(crate) fn new(ids: AuthCertKeyIds, published: SystemTime, expires: SystemTime) -> Self {
+    pub fn new(ids: AuthCertKeyIds, published: SystemTime, expires: SystemTime) -> Self {
         AuthCertMeta {
             ids,
             published,
@@ -117,15 +119,15 @@ impl AuthCertMeta {
     }
 
     /// Return the key IDs for this certificate
-    pub(crate) fn key_ids(&self) -> &AuthCertKeyIds {
+    pub fn key_ids(&self) -> &AuthCertKeyIds {
         &self.ids
     }
     /// Return the published time for this certificate
-    pub(crate) fn published(&self) -> SystemTime {
+    pub fn published(&self) -> SystemTime {
         self.published
     }
     /// Return the expiration time for this certificate
-    pub(crate) fn expires(&self) -> SystemTime {
+    pub fn expires(&self) -> SystemTime {
         self.expires
     }
 }

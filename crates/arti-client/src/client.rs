@@ -1128,8 +1128,11 @@ impl<R: Runtime> TorClient<R> {
         let client_isolation = IsolationToken::new();
         let inert_client = InertTorClient::new(config)?;
 
-        let dirmgr_store = DirMgrStore::new(&config.dir_mgr_config()?, runtime.clone(), false)
-            .map_err(ErrorDetail::DirMgrSetup)?;
+        let dirmgr_store = {
+            let mut dir_cfg = config.dir_mgr_config()?;
+            dir_cfg.extensions = dirmgr_extensions.clone();
+            DirMgrStore::new(&dir_cfg, runtime.clone(), false).map_err(ErrorDetail::DirMgrSetup)?
+        };
 
         let inner = Box::new(NotConstructedInner {
             config: config.clone(),
@@ -2800,7 +2803,43 @@ mod test {
     use crate::config::TorClientConfigBuilder;
     use crate::{ErrorKind, HasKind};
 
+    /// Return a `StoreOpener` that opens a new, empty in-memory store.
+    #[cfg(all(feature = "custom-dir-store", not(feature = "sqlite")))]
+    fn memory_store_opener() -> Arc<dyn crate::config::dir::storage::StoreOpener> {
+        use crate::config::dir::{DirMgrConfig, storage};
+        Arc::new(
+            |_: &DirMgrConfig, _readonly: bool| -> tor_dirmgr::Result<Box<dyn storage::Store>> {
+                Ok(Box::new(storage::MemoryStore::new()))
+            },
+        )
+    }
+
+    /// Return a builder for a `TorClient` that has a directory store,
+    /// whichever of the store features are enabled.
+    fn builder<R: Runtime>(rt: R) -> TorClientBuilder<R> {
+        let builder = TorClient::with_runtime(rt);
+        #[cfg(all(feature = "custom-dir-store", not(feature = "sqlite")))]
+        let builder = builder.dirmgr_store_opener(memory_store_opener());
+        builder
+    }
+
+    /// Return the directory manager extensions for a `TorClient` that has a directory store,
+    /// whichever of the store features are enabled.
+    fn dirmgr_extensions() -> tor_dirmgr::config::DirMgrExtensions {
+        #[allow(unused_mut)]
+        let mut extensions = tor_dirmgr::config::DirMgrExtensions::default();
+        #[cfg(all(feature = "custom-dir-store", not(feature = "sqlite")))]
+        {
+            extensions.store_opener = Some(memory_store_opener());
+        }
+        extensions
+    }
+
     #[test]
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "custom-dir-store")),
+        ignore = "needs a directory store"
+    )]
     fn create_unbootstrapped() {
         tor_rtcompat::test_with_one_runtime!(|rt| async {
             let state_dir = tempfile::tempdir().unwrap();
@@ -2808,7 +2847,7 @@ mod test {
             let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
                 .build()
                 .unwrap();
-            let _ = TorClient::with_runtime(rt)
+            let _ = builder(rt)
                 .config(cfg)
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped()
@@ -2820,7 +2859,7 @@ mod test {
             let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
                 .build()
                 .unwrap();
-            let _ = TorClient::with_runtime(rt)
+            let _ = builder(rt)
                 .config(cfg)
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped_async()
@@ -2830,6 +2869,10 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "custom-dir-store")),
+        ignore = "needs a directory store"
+    )]
     fn unbootstrapped_client_unusable() {
         tor_rtcompat::test_with_one_runtime!(|rt| async {
             let state_dir = tempfile::tempdir().unwrap();
@@ -2838,7 +2881,7 @@ mod test {
                 .build()
                 .unwrap();
             // Test sync
-            let client = TorClient::with_runtime(rt)
+            let client = builder(rt)
                 .config(cfg)
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped()
@@ -2856,7 +2899,7 @@ mod test {
                 .build()
                 .unwrap();
             // Test sync
-            let client = TorClient::with_runtime(rt)
+            let client = builder(rt)
                 .config(cfg)
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped_async()
@@ -2946,6 +2989,10 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "custom-dir-store")),
+        ignore = "needs a directory store"
+    )]
     fn reconfigure_all_or_nothing() {
         tor_rtcompat::test_with_one_runtime!(|rt| async {
             let state_dir = tempfile::tempdir().unwrap();
@@ -2953,7 +3000,7 @@ mod test {
             let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
                 .build()
                 .unwrap();
-            let tor_client = TorClient::with_runtime(rt)
+            let tor_client = builder(rt)
                 .config(cfg.clone())
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped()
@@ -2968,7 +3015,7 @@ mod test {
             let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
                 .build()
                 .unwrap();
-            let tor_client = TorClient::with_runtime(rt)
+            let tor_client = builder(rt)
                 .config(cfg.clone())
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped_async()
@@ -2977,6 +3024,61 @@ mod test {
             tor_client
                 .reconfigure(&cfg, Reconfigure::AllOrNothing)
                 .unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "custom-dir-store")]
+    fn injected_dir_store() {
+        use crate::config::dir::{DirMgrConfig, storage};
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache_path = cache_dir.path().to_owned();
+            let cfg = TorClientConfigBuilder::from_directories(state_dir, &cache_dir)
+                .build()
+                .unwrap();
+            let opened = Arc::new(Mutex::new(Vec::new()));
+            let opened_ = Arc::clone(&opened);
+            let opener = move |cfg: &DirMgrConfig,
+                               readonly: bool|
+                  -> tor_dirmgr::Result<Box<dyn storage::Store>> {
+                opened_
+                    .lock()
+                    .unwrap()
+                    .push((cfg.cache_dir.clone(), readonly));
+                Ok(Box::new(storage::MemoryStore::new()))
+            };
+            let client = TorClient::with_runtime(rt)
+                .config(cfg)
+                .bootstrap_behavior(BootstrapBehavior::Manual)
+                .dirmgr_store_opener(Arc::new(opener))
+                .create_unbootstrapped()
+                .unwrap();
+            assert_eq!(*opened.lock().unwrap(), [(cache_path.clone(), false)]);
+            // A clone shares the store: nothing is opened again.
+            let _isolated = client.isolated_client();
+            assert_eq!(opened.lock().unwrap().len(), 1);
+            // The default store was never opened.
+            assert!(!cache_path.join("dir.sqlite3").try_exists().unwrap());
+        });
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite"))]
+    fn no_dir_store() {
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+                .build()
+                .unwrap();
+            let err = TorClient::with_runtime(rt)
+                .config(cfg)
+                .create_unbootstrapped()
+                .err()
+                .unwrap();
+            assert_eq!(err.kind(), ErrorKind::BadApiUsage, "{err}");
         });
     }
 
@@ -3116,7 +3218,7 @@ mod test {
                 BootstrapBehavior::OnDemand,
                 action,
                 Arc::new(FakeDirProviderBuilder(provider.clone())),
-                Default::default(),
+                dirmgr_extensions(),
             )
             .unwrap();
             (dir, client)
@@ -3145,6 +3247,10 @@ mod test {
         }
 
         #[test]
+        #[cfg_attr(
+            not(any(feature = "sqlite", feature = "custom-dir-store")),
+            ignore = "needs a directory store"
+        )]
         fn disabled_at_runtime() {
             MockRuntime::test_with_various(|rt| async move {
                 let provider = FakeDirProvider::new(None);
@@ -3199,6 +3305,10 @@ mod test {
         }
 
         #[test]
+        #[cfg_attr(
+            not(any(feature = "sqlite", feature = "custom-dir-store")),
+            ignore = "needs a directory store"
+        )]
         fn rejected_at_startup() {
             for action in [
                 UnsupportedSoftwareAction::ExitProcess,

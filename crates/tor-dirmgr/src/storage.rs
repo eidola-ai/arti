@@ -1,33 +1,55 @@
 //! Methods for storing and loading directory information from disk.
 //!
-//! We have code implemented for a flexible storage format based on sqlite.
+//! We have code implemented for a flexible storage format based on sqlite,
+//! available with the `sqlite` feature.
+//!
+//! With the `custom-store` feature, this module is public:
+//! an application can implement [`Store`] itself,
+//! and supply it to the directory manager with a [`StoreOpener`]
+//! (see [`DirMgrExtensions::store_opener`](crate::config::DirMgrExtensions::store_opener)).
+//! A non-persistent [`MemoryStore`] is also provided.
 
 // (There was once a read-only format based on the C tor implementation's
 // storage: Search the git history for tor-dirmgr/src/storage/legacy.rs
 // if you ever need to reinstate it.)
 
-use tor_netdoc::doc::authcert::AuthCertKeyIds;
-use tor_netdoc::doc::microdesc::MdDigest;
-use tor_netdoc::doc::netstatus::{ConsensusFlavor, ProtoStatuses};
+pub use tor_netdoc::doc::authcert::AuthCertKeyIds;
+pub use tor_netdoc::doc::microdesc::MdDigest;
+#[cfg(feature = "custom-store")]
+pub use tor_netdoc::doc::netstatus::Lifetime;
+pub use tor_netdoc::doc::netstatus::{ConsensusFlavor, ProtoStatuses};
 
 #[cfg(feature = "routerdesc")]
-use tor_netdoc::doc::routerdesc::RdDigest;
+pub use tor_netdoc::doc::routerdesc::RdDigest;
 
 #[cfg(feature = "bridge-client")]
-pub(crate) use tor_guardmgr::bridge::BridgeConfig;
+pub use tor_guardmgr::bridge::BridgeConfig;
 
-use crate::docmeta::{AuthCertMeta, ConsensusMeta};
-use crate::{Error, Result};
+pub use crate::docmeta::{AuthCertMeta, ConsensusMeta};
+pub use crate::{Error, Result};
+
+#[cfg(feature = "custom-store")]
+use crate::DirMgrConfig;
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "custom-store")]
+use std::fmt;
 use std::fs::File;
 use std::io::Result as IoResult;
 use std::str::Utf8Error;
 use std::time::SystemTime;
 use time::Duration;
 
+#[cfg(any(test, feature = "custom-store"))]
+pub(crate) mod memory;
+#[cfg(feature = "sqlite")]
 pub(crate) mod sqlite;
+#[cfg(test)]
+mod test_suite;
 
+#[cfg(feature = "custom-store")]
+pub use memory::MemoryStore;
+#[cfg(feature = "sqlite")]
 pub(crate) use sqlite::SqliteStore;
 
 /// Convenient Sized & dynamic [`Store`]
@@ -65,15 +87,22 @@ impl DocumentText {
     /// Create a new DocumentText holding the provided string.
     pub(crate) fn from_string(s: String) -> Self {
         DocumentText {
-            s: InputString::Utf8(s),
+            s: InputString::from(s),
         }
     }
 }
 
-/// An abstraction over a possible string that we've loaded or mapped from
-/// a cache.
+/// A possible string that we've loaded or mapped from a cache.
+///
+/// A [`Store`] returns documents in this form.
+/// Construct one with `From<String>` (for text that is known to be UTF-8)
+/// or `From<Vec<u8>>` (for bytes that will be checked when they are used).
 #[derive(Debug)]
-pub(crate) enum InputString {
+pub struct InputString(InputStringInner);
+
+/// The representation of an [`InputString`].
+#[derive(Debug)]
+enum InputStringInner {
     /// A string that's been validated as UTF-8
     Utf8(String),
     /// A set of unvalidated bytes.
@@ -95,7 +124,7 @@ pub(crate) enum InputString {
 
 impl InputString {
     /// Return a view of this InputString as a &str, if it is valid UTF-8.
-    pub(crate) fn as_str(&self) -> Result<&str> {
+    pub fn as_str(&self) -> Result<&str> {
         self.as_str_impl().map_err(Error::BadUtf8InCache)
     }
 
@@ -105,9 +134,9 @@ impl InputString {
         // this function is called so remember the result
         // we got with `validated`
 
-        match self {
-            InputString::Utf8(s) => Ok(s.as_ref()),
-            InputString::UncheckedBytes { bytes, validated } => {
+        match &self.0 {
+            InputStringInner::Utf8(s) => Ok(s.as_ref()),
+            InputStringInner::UncheckedBytes { bytes, validated } => {
                 if *validated.borrow() {
                     unsafe { Ok(std::str::from_utf8_unchecked(&bytes[..])) }
                 } else {
@@ -117,7 +146,7 @@ impl InputString {
                 }
             }
             #[cfg(feature = "mmap")]
-            InputString::MappedBytes { bytes, validated } => {
+            InputStringInner::MappedBytes { bytes, validated } => {
                 if *validated.borrow() {
                     unsafe { Ok(std::str::from_utf8_unchecked(&bytes[..])) }
                 } else {
@@ -133,6 +162,7 @@ impl InputString {
     /// We'll try to memory-map the file if we can.  If that fails, or if we
     /// were built without the `mmap` feature, we'll fall back to reading the
     /// file into memory.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub(crate) fn load(file: File) -> IoResult<Self> {
         #[cfg(feature = "mmap")]
         {
@@ -143,48 +173,49 @@ impl InputString {
                 memmap2::Mmap::map(&file)
             };
             if let Ok(bytes) = mapping {
-                return Ok(InputString::MappedBytes {
+                return Ok(InputString(InputStringInner::MappedBytes {
                     bytes,
                     validated: RefCell::new(false),
-                });
+                }));
             }
         }
         use std::io::{BufReader, Read};
         let mut f = BufReader::new(file);
         let mut result = String::new();
         f.read_to_string(&mut result)?;
-        Ok(InputString::Utf8(result))
+        Ok(InputString(InputStringInner::Utf8(result)))
     }
 }
 
 impl AsRef<[u8]> for InputString {
     fn as_ref(&self) -> &[u8] {
-        match self {
-            InputString::Utf8(s) => s.as_ref(),
-            InputString::UncheckedBytes { bytes, .. } => &bytes[..],
+        match &self.0 {
+            InputStringInner::Utf8(s) => s.as_ref(),
+            InputStringInner::UncheckedBytes { bytes, .. } => &bytes[..],
             #[cfg(feature = "mmap")]
-            InputString::MappedBytes { bytes, .. } => &bytes[..],
+            InputStringInner::MappedBytes { bytes, .. } => &bytes[..],
         }
     }
 }
 
 impl From<String> for InputString {
     fn from(s: String) -> InputString {
-        InputString::Utf8(s)
+        InputString(InputStringInner::Utf8(s))
     }
 }
 
 impl From<Vec<u8>> for InputString {
     fn from(bytes: Vec<u8>) -> InputString {
-        InputString::UncheckedBytes {
+        InputString(InputStringInner::UncheckedBytes {
             bytes,
             validated: RefCell::new(false),
-        }
+        })
     }
 }
 
 /// Configuration of expiration of each element of a [`Store`].
-pub(crate) struct ExpirationConfig {
+#[non_exhaustive]
+pub struct ExpirationConfig {
     /// How long to keep router descriptors.
     ///
     /// This timeout is measured since the publication date of the router
@@ -205,6 +236,27 @@ pub(crate) struct ExpirationConfig {
     pub(super) authcerts: Duration,
     /// How long to keep expired consensus.
     pub(super) consensuses: Duration,
+}
+
+#[cfg(any(test, feature = "custom-store"))]
+#[cfg_attr(not(feature = "custom-store"), allow(dead_code))]
+impl ExpirationConfig {
+    /// How long to keep router descriptors, measured from their publication time.
+    pub fn router_descs(&self) -> std::time::Duration {
+        self.router_descs.unsigned_abs()
+    }
+    /// How long to keep microdescriptors, measured from the last time they were listed.
+    pub fn microdescs(&self) -> std::time::Duration {
+        self.microdescs.unsigned_abs()
+    }
+    /// How long to keep authority certificates, measured from when they expire.
+    pub fn authcerts(&self) -> std::time::Duration {
+        self.authcerts.unsigned_abs()
+    }
+    /// How long to keep consensuses, measured from the end of their validity.
+    pub fn consensuses(&self) -> std::time::Duration {
+        self.consensuses.unsigned_abs()
+    }
 }
 
 /// Configuration of expiration shared between [`Store`] implementations.
@@ -234,7 +286,18 @@ pub(crate) const EXPIRATION_DEFAULTS: ExpirationConfig = {
 ///
 /// When creating an instance of this [`Store`], it should try to grab the lock during
 /// initialization (`is_readonly() iff some other implementation grabbed it`).
-pub(crate) trait Store: Send + 'static {
+///
+/// A `Store` is a cache: the directory manager can recover from the loss of
+/// anything in it, by downloading it again.
+///
+/// The directory manager calls these methods while holding a
+/// [`std::sync::Mutex`], from asynchronous code,
+/// so they should not block for long.
+///
+/// Some methods exist only when particular features of this crate are enabled.
+/// Each of those has a default implementation that stores nothing,
+/// so that enabling a feature does not break a `Store` written without it.
+pub trait Store: Send + 'static {
     /// Return true if this [`Store`] is opened in read-only mode.
     fn is_readonly(&self) -> bool;
     /// Try to upgrade from a read-only connection to a read-write connection.
@@ -304,37 +367,62 @@ pub(crate) trait Store: Send + 'static {
     /// Read all the microdescriptors listed in `input` from the cache.
     ///
     /// Only available when the `routerdesc` feature is present.
+    ///
+    /// The default implementation returns nothing.
     #[cfg(feature = "routerdesc")]
-    fn routerdescs(&self, digests: &[RdDigest]) -> Result<HashMap<RdDigest, String>>;
+    fn routerdescs(&self, digests: &[RdDigest]) -> Result<HashMap<RdDigest, String>> {
+        let _ = digests;
+        Ok(HashMap::new())
+    }
     /// Store every router descriptors in `input` into the cache.
+    ///
+    /// The default implementation stores nothing.
     #[cfg(feature = "routerdesc")]
     #[allow(unused)]
-    fn store_routerdescs(&mut self, digests: &[(&str, SystemTime, &RdDigest)]) -> Result<()>;
+    fn store_routerdescs(&mut self, digests: &[(&str, SystemTime, &RdDigest)]) -> Result<()> {
+        let _ = digests;
+        Ok(())
+    }
 
     /// Look up a cached bridge descriptor.
+    ///
+    /// The default implementation returns nothing.
     #[cfg(feature = "bridge-client")]
-    fn lookup_bridgedesc(&self, bridge: &BridgeConfig) -> Result<Option<CachedBridgeDescriptor>>;
+    fn lookup_bridgedesc(&self, bridge: &BridgeConfig) -> Result<Option<CachedBridgeDescriptor>> {
+        let _ = bridge;
+        Ok(None)
+    }
 
     /// Store a cached bridge descriptor.
     ///
     /// This entry will be deleted some time after `until`
     /// (but the caller is not allowed to rely on either timely deletion,
     /// or retention until that time).
+    ///
+    /// The default implementation stores nothing.
     #[cfg(feature = "bridge-client")]
     fn store_bridgedesc(
         &mut self,
         bridge: &BridgeConfig,
         entry: CachedBridgeDescriptor,
         until: SystemTime,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        let _ = (bridge, entry, until);
+        Ok(())
+    }
 
     /// Delete a cached bridge descriptor for this bridge.
     ///
     /// It's not an error if it's not present.
+    ///
+    /// The default implementation does nothing.
     #[cfg(feature = "bridge-client")]
     // Nothing uses this yet; removal is handled from `expire_all`.
     #[allow(dead_code)] // see also allow on DELETE_BRIDGEDESC
-    fn delete_bridgedesc(&mut self, bridge: &BridgeConfig) -> Result<()>;
+    fn delete_bridgedesc(&mut self, bridge: &BridgeConfig) -> Result<()> {
+        let _ = bridge;
+        Ok(())
+    }
 
     /// Try to update our cached protocol recommendations to those listed in `protocols`.
     fn update_protocol_recommendations(
@@ -349,13 +437,63 @@ pub(crate) trait Store: Send + 'static {
 
 /// Value in the bridge descriptor cache
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 #[cfg_attr(not(feature = "bridge-client"), allow(dead_code))]
-pub(crate) struct CachedBridgeDescriptor {
+pub struct CachedBridgeDescriptor {
     /// When we fetched this
-    pub(crate) fetched: SystemTime,
+    pub fetched: SystemTime,
 
     /// The document text, as we fetched it
-    pub(crate) document: String,
+    pub document: String,
+}
+
+impl CachedBridgeDescriptor {
+    /// Construct a new `CachedBridgeDescriptor`, for a `document` fetched at `fetched`.
+    #[cfg_attr(not(feature = "custom-store"), allow(dead_code))]
+    pub fn new(fetched: SystemTime, document: String) -> Self {
+        CachedBridgeDescriptor { fetched, document }
+    }
+}
+
+/// An object that can open a [`Store`] for a directory manager.
+#[cfg(feature = "custom-store")]
+///
+/// Install one with
+/// [`DirMgrExtensions::store_opener`](crate::config::DirMgrExtensions::store_opener)
+/// to use your own store in place of the default SQLite one.
+///
+/// Any `Fn(&DirMgrConfig, bool) -> Result<Box<dyn Store>>` closure
+/// implements this trait.
+pub trait StoreOpener: Send + Sync + 'static {
+    /// Open a store for a directory manager whose configuration is `config`.
+    ///
+    /// The store is opened once, when the directory manager's storage is
+    /// created; `config.cache_dir` and `config.cache_trust` are available
+    /// to implementations that keep their data on disk.
+    ///
+    /// If `readonly` is true, the store must be opened read-only,
+    /// and should fail if there is nothing to read.
+    /// Otherwise, the store should try to acquire exclusive write access, and
+    /// should open read-only if another process already has it
+    /// (see [`Store::is_readonly`] and [`Store::upgrade_to_readwrite`]).
+    fn open_store(&self, config: &DirMgrConfig, readonly: bool) -> Result<Box<dyn Store>>;
+}
+
+#[cfg(feature = "custom-store")]
+impl<F> StoreOpener for F
+where
+    F: Fn(&DirMgrConfig, bool) -> Result<Box<dyn Store>> + Send + Sync + 'static,
+{
+    fn open_store(&self, config: &DirMgrConfig, readonly: bool) -> Result<Box<dyn Store>> {
+        self(config, readonly)
+    }
+}
+
+#[cfg(feature = "custom-store")]
+impl fmt::Debug for dyn StoreOpener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("dyn StoreOpener")
+    }
 }
 
 #[cfg(test)]

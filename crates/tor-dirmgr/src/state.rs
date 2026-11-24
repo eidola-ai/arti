@@ -1339,16 +1339,19 @@ mod test {
         }
     }
 
-    /// Makes a memory-backed storage.
+    /// Makes a temporary storage.
     fn temp_store() -> (TempDir, Mutex<DynStore>) {
         let tempdir = TempDir::new().unwrap();
 
+        #[cfg(feature = "sqlite")]
         let store = crate::storage::SqliteStore::from_path_and_mistrust(
             tempdir.path(),
             &fs_mistrust::Mistrust::new_dangerously_trust_everyone(),
             false,
         )
         .unwrap();
+        #[cfg(not(feature = "sqlite"))]
+        let store = crate::storage::memory::MemoryStore::new();
 
         (tempdir, Mutex::new(Box::new(store)))
     }

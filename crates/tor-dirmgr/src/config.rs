@@ -90,9 +90,22 @@ pub struct DirMgrConfig {
 impl DirMgrConfig {
     /// Create a store from this configuration.
     ///
+    /// If a [`StoreOpener`](crate::storage::StoreOpener) is configured in
+    /// `extensions`, we use it; otherwise we open the default SQLite store.
+    ///
     /// Note that each time this is called, a new store object will be
     /// created: you probably only want to call this once.
     pub(crate) fn open_store(&self, readonly: bool) -> Result<DynStore> {
+        #[cfg(feature = "custom-store")]
+        if let Some(opener) = &self.extensions.store_opener {
+            return opener.open_store(self, readonly);
+        }
+        self.open_default_store(readonly)
+    }
+
+    /// Open the default (SQLite) store for this configuration.
+    #[cfg(feature = "sqlite")]
+    fn open_default_store(&self, readonly: bool) -> Result<DynStore> {
         Ok(Box::new(
             crate::storage::SqliteStore::from_path_and_mistrust(
                 &self.cache_dir,
@@ -100,6 +113,17 @@ impl DirMgrConfig {
                 readonly,
             )?,
         ))
+    }
+
+    /// Report that there is no default store, since we were built without SQLite.
+    #[cfg(not(feature = "sqlite"))]
+    #[allow(clippy::unused_self)]
+    fn open_default_store(&self, _readonly: bool) -> Result<DynStore> {
+        Err(tor_error::bad_api_usage!(
+            "No directory store configured: tor-dirmgr was built without the `sqlite` feature, \
+             and no `StoreOpener` was set in `DirMgrExtensions::store_opener`"
+        )
+        .into())
     }
 
     /// Return a slice of the configured authorities
@@ -146,6 +170,16 @@ pub struct DirMgrExtensions {
     /// A filter to be used when installing new directory objects.
     #[cfg(feature = "dirfilter")]
     pub filter: crate::filter::FilterConfig,
+
+    /// An object to open the directory store, in place of the default SQLite store.
+    ///
+    /// The store is opened once, when the [`DirMgrStore`](crate::DirMgrStore) is created;
+    /// changing this on a running directory manager has no effect.
+    ///
+    /// If this is `None`, and this crate was built without the `sqlite` feature,
+    /// opening the store fails.
+    #[cfg(feature = "custom-store")]
+    pub store_opener: Option<std::sync::Arc<dyn crate::storage::StoreOpener>>,
 }
 
 #[cfg(test)]
